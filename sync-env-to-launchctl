@@ -1,0 +1,189 @@
+#!/bin/bash
+
+# sync-env-to-launchctl
+# Syncs environment variables from ~/.bash_profile to LaunchAgent
+
+set -euo pipefail
+
+# Configuration
+PLIST_PATH="$HOME/Library/LaunchAgents/com.user.environment.plist"
+BASH_PROFILE="$HOME/.bash_profile"
+TEMP_DIR="/tmp/sync-env-$$"
+
+# Variables to exclude from syncing
+EXCLUDE_VARS=(
+    "BASH_ARGC" "BASH_ARGV" "BASH_LINENO" "BASH_SOURCE"
+    "DIRSTACK" "EUID" "GROUPS" "HOSTNAME" "PPID" "SECONDS"
+    "SHELLOPTS" "SHLVL" "UID" "_" "COLUMNS" "LINES"
+    "OLDPWD" "PWD" "SHELL" "TERM" "USER" "USERNAME"
+    "HISTFILE" "HISTFILESIZE" "HISTSIZE" "HISTCONTROL"
+    "PROMPT_COMMAND" 
+    "PIPESTATUS" "FUNCNAME" "IFS" "LINENO" "RANDOM"
+)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log() { echo -e "${GREEN}[$(date +'%H:%M:%S')]${NC} $1"; }
+warn() { echo -e "${YELLOW}[$(date +'%H:%M:%S')] WARNING:${NC} $1"; }
+error() { echo -e "${RED}[$(date +'%H:%M:%S')] ERROR:${NC} $1" >&2; }
+
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
+
+# Check if running in interactive mode (for debugging)
+DRY_RUN=false
+VERBOSE=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run) DRY_RUN=true; shift ;;
+        --verbose|-v) VERBOSE=true; shift ;;
+        --help|-h)
+            echo "Usage: $0 [--dry-run] [--verbose]"
+            echo "  --dry-run   Show what would be done without making changes"
+            echo "  --verbose   Show detailed output"
+            exit 0
+            ;;
+        *) error "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# Create temp directory
+mkdir -p "$TEMP_DIR"
+
+# Function to check if variable should be excluded
+should_exclude() {
+    local var=$1
+    for exclude in "${EXCLUDE_VARS[@]}"; do
+        [[ "$var" == "$exclude" ]] && return 0
+    done
+    # Exclude functions and readonly variables
+    [[ "$var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*\(\)$ ]] && return 0
+    return 1
+}
+
+# Get environment before sourcing
+log "Capturing current environment..."
+env | sort > "$TEMP_DIR/env_before.txt"
+
+# Source bash profile in a subshell and get new environment
+log "Sourcing $BASH_PROFILE..."
+(
+    set +e  # Don't exit on errors during sourcing
+    source "$BASH_PROFILE" 2>/dev/null
+    env | sort
+) > "$TEMP_DIR/env_after.txt"
+
+# Find new or changed environment variables
+log "Detecting changes..."
+comm -13 "$TEMP_DIR/env_before.txt" "$TEMP_DIR/env_after.txt" > "$TEMP_DIR/env_diff.txt"
+
+# Process the differences
+declare -A env_vars
+while IFS='=' read -r key value; do
+    # Skip if no = sign
+    [[ ! "$key" =~ = ]] || continue
+    
+    # Skip excluded variables
+    should_exclude "$key" && continue
+    
+    # Skip empty keys
+    [[ -z "$key" ]] && continue
+    
+    env_vars["$key"]="$value"
+    [[ "$VERBOSE" == "true" ]] && echo "  + $key=$value"
+done < "$TEMP_DIR/env_diff.txt"
+
+# Generate plist content
+log "Generating LaunchAgent plist..."
+cat > "$TEMP_DIR/environment.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.environment</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>sh</string>
+        <string>-c</string>
+        <string>
+EOF
+
+# Build the launchctl commands
+commands=""
+for key in "${!env_vars[@]}"; do
+    # Escape the value for shell
+    value="${env_vars[$key]}"
+    # Escape double quotes and backslashes
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    commands+="            launchctl setenv \"$key\" \"$value\"\n"
+done
+
+# Complete the plist
+echo -n "$commands" >> "$TEMP_DIR/environment.plist"
+cat >> "$TEMP_DIR/environment.plist" <<'EOF'
+        </string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+# Validate plist
+if ! plutil -lint "$TEMP_DIR/environment.plist" >/dev/null 2>&1; then
+    error "Generated plist is invalid!"
+    exit 1
+fi
+
+# Show what would be done in dry-run mode
+if [[ "$DRY_RUN" == "true" ]]; then
+    log "DRY RUN: Would update $PLIST_PATH"
+    echo "--- New environment variables ---"
+    for key in "${!env_vars[@]}"; do
+        echo "$key=${env_vars[$key]}"
+    done
+    echo "--- Plist content ---"
+    cat "$TEMP_DIR/environment.plist"
+    exit 0
+fi
+
+# Backup existing plist if it exists
+if [[ -f "$PLIST_PATH" ]]; then
+    backup_path="$PLIST_PATH.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$PLIST_PATH" "$backup_path"
+    log "Backed up existing plist to $backup_path"
+fi
+
+# Create LaunchAgents directory if needed
+mkdir -p "$(dirname "$PLIST_PATH")"
+
+# Install the new plist
+cp "$TEMP_DIR/environment.plist" "$PLIST_PATH"
+log "Updated $PLIST_PATH"
+
+# Unload and reload the LaunchAgent
+if launchctl list | grep -q "com.user.environment"; then
+    log "Reloading LaunchAgent..."
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+fi
+launchctl load "$PLIST_PATH"
+
+# Apply changes immediately to current session
+log "Applying environment variables to current session..."
+for key in "${!env_vars[@]}"; do
+    launchctl setenv "$key" "${env_vars[$key]}"
+done
+
+log "✅ Environment variables synced successfully!"
+log "   ${#env_vars[@]} variables updated"
+log "   Changes will fully take effect for new applications"
+log "   For complete effect, log out and log back in"
