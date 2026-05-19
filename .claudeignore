@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+
+# Editor / backup
+*~
+.#*
+\#*
+
+# Logs
+*.log
+
+# Secrets (also enforced via permissions.deny)
+.env
+.env.*
+!.env.example
+
+# User-specific launchd config
+com.user.sync-env
+
+# Local Claude state
+.claude/settings.local.json
+.claude/sessions/
+.claude/tasks/
+.handoffs/
