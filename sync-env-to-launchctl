@@ -75,7 +75,7 @@ env | sort > "$TEMP_DIR/env_before.txt"
 # Source bash profile in a subshell and get new environment
 log "Sourcing $BASH_PROFILE..."
 (
-    set +e  # Don't exit on errors during sourcing
+    set +eu  # Don't exit on errors or unset vars during sourcing (bash_profile may reference unset vars under set -u)
     source "$BASH_PROFILE" 2>/dev/null
     env | sort
 ) > "$TEMP_DIR/env_after.txt"
@@ -84,19 +84,17 @@ log "Sourcing $BASH_PROFILE..."
 log "Detecting changes..."
 comm -13 "$TEMP_DIR/env_before.txt" "$TEMP_DIR/env_after.txt" > "$TEMP_DIR/env_diff.txt"
 
-# Process the differences
-declare -A env_vars
+# Process the differences -> filtered list (key=value per line)
+# Using a temp file instead of `declare -A` for bash 3.2 compatibility (macOS /bin/bash).
+: > "$TEMP_DIR/env_filtered.txt"
 while IFS='=' read -r key value; do
-    # Skip if no = sign
-    [[ ! "$key" =~ = ]] || continue
-    
-    # Skip excluded variables
-    should_exclude "$key" && continue
-    
     # Skip empty keys
     [[ -z "$key" ]] && continue
-    
-    env_vars["$key"]="$value"
+
+    # Skip excluded variables
+    should_exclude "$key" && continue
+
+    printf '%s=%s\n' "$key" "$value" >> "$TEMP_DIR/env_filtered.txt"
     [[ "$VERBOSE" == "true" ]] && echo "  + $key=$value"
 done < "$TEMP_DIR/env_diff.txt"
 
@@ -118,14 +116,12 @@ EOF
 
 # Build the launchctl commands
 commands=""
-for key in "${!env_vars[@]}"; do
-    # Escape the value for shell
-    value="${env_vars[$key]}"
-    # Escape double quotes and backslashes
+while IFS='=' read -r key value; do
+    # Escape double quotes and backslashes for shell
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
     commands+="            launchctl setenv \"$key\" \"$value\"\n"
-done
+done < "$TEMP_DIR/env_filtered.txt"
 
 # Complete the plist
 echo -n "$commands" >> "$TEMP_DIR/environment.plist"
@@ -148,9 +144,7 @@ fi
 if [[ "$DRY_RUN" == "true" ]]; then
     log "DRY RUN: Would update $PLIST_PATH"
     echo "--- New environment variables ---"
-    for key in "${!env_vars[@]}"; do
-        echo "$key=${env_vars[$key]}"
-    done
+    cat "$TEMP_DIR/env_filtered.txt"
     echo "--- Plist content ---"
     cat "$TEMP_DIR/environment.plist"
     exit 0
@@ -179,11 +173,12 @@ launchctl load "$PLIST_PATH"
 
 # Apply changes immediately to current session
 log "Applying environment variables to current session..."
-for key in "${!env_vars[@]}"; do
-    launchctl setenv "$key" "${env_vars[$key]}"
-done
+while IFS='=' read -r key value; do
+    launchctl setenv "$key" "$value"
+done < "$TEMP_DIR/env_filtered.txt"
 
+var_count=$(wc -l < "$TEMP_DIR/env_filtered.txt" | tr -d ' ')
 log "✅ Environment variables synced successfully!"
-log "   ${#env_vars[@]} variables updated"
+log "   $var_count variables updated"
 log "   Changes will fully take effect for new applications"
 log "   For complete effect, log out and log back in"
