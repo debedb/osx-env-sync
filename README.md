@@ -11,9 +11,11 @@ When you set environment variables in `~/.bash_profile`, they're only available 
 How it works
 ------------
 
-1.  Captures current environment variables
-2.  Sources `~/.bash_profile` to get new environment
-3.  Detects changes and new variables
+1.  Captures a clean baseline environment (`env -i`), never the caller's, so
+    running it from a terminal or agent session neither truncates the result
+    nor leaks that session's own variables
+2.  Sources `~/.bash_profile` in that clean shell (its output discarded)
+3.  Takes every variable the profile added or changed
 4.  Creates/updates a LaunchAgent plist that sets these variables
 5.  Applies changes immediately (full effect after logout/login)
 
