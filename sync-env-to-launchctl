@@ -68,17 +68,24 @@ should_exclude() {
     return 1
 }
 
-# Get environment before sourcing
-log "Capturing current environment..."
-env | sort > "$TEMP_DIR/env_before.txt"
+# Both snapshots come from a clean environment, never the caller's. Run from a
+# shell that already sourced the profile, the diff would hold only what changed,
+# and the plist below is rewritten wholesale - everything else would be dropped.
+# A clean baseline also keeps a terminal's or agent session's own variables out.
+clean_env() {
+    env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" \
+        SHELL=/bin/bash TMPDIR="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$@"
+}
 
-# Source bash profile in a subshell and get new environment
+log "Capturing clean baseline environment..."
+clean_env /bin/bash -c 'env' | sort > "$TEMP_DIR/env_before.txt"
+
+# Source bash profile in a clean shell and get new environment. Its output is
+# discarded: anything it prints would become a bogus variable and unsort the
+# file that comm reads.
 log "Sourcing $BASH_PROFILE..."
-(
-    set +eu  # Don't exit on errors or unset vars during sourcing (bash_profile may reference unset vars under set -u)
-    source "$BASH_PROFILE" 2>/dev/null
-    env | sort
-) > "$TEMP_DIR/env_after.txt"
+clean_env /bin/bash -c 'set +eu; source "$1" >/dev/null 2>&1; env' _ "$BASH_PROFILE" \
+    | sort > "$TEMP_DIR/env_after.txt"
 
 # Find new or changed environment variables
 log "Detecting changes..."
@@ -114,14 +121,18 @@ cat > "$TEMP_DIR/environment.plist" <<'EOF'
         <string>
 EOF
 
-# Build the launchctl commands
+# Build the launchctl commands, one per line. Values are single-quoted so sh
+# expands nothing in them ($, backticks); a ' inside becomes '\''. The whole
+# string is then XML-escaped for the plist <string>. Replacements are quoted
+# so bash 5.2's patsub_replacement cannot read & as "the match".
 commands=""
 while IFS='=' read -r key value; do
-    # Escape double quotes and backslashes for shell
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    commands+="            launchctl setenv \"$key\" \"$value\"\n"
+    value=${value//\'/\'\\\'\'}
+    commands+="            launchctl setenv '$key' '$value'"$'\n'
 done < "$TEMP_DIR/env_filtered.txt"
+commands=${commands//&/"&amp;"}
+commands=${commands//</"&lt;"}
+commands=${commands//>/"&gt;"}
 
 # Complete the plist
 echo -n "$commands" >> "$TEMP_DIR/environment.plist"
