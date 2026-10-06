@@ -129,7 +129,13 @@ while IFS='=' read -r key value; do
     value="${value//&/&amp;}"
     value="${value//</&lt;}"
     value="${value//>/&gt;}"
-    commands+="            launchctl setenv \"$key\" \"$value\"\n"
+    # A real newline, not "\n": this string is written with `echo -n`, which
+    # does not interpret escapes, so a literal backslash-n would land in the
+    # plist. sh then reads `"$value"\n` as $value followed by an escaped n --
+    # appending "n" to the value -- and every later setenv on that one line
+    # becomes extra arguments to the first one.
+    commands+="            launchctl setenv \"$key\" \"$value\"
+"
 done < "$TEMP_DIR/env_filtered.txt"
 
 # Complete the plist
